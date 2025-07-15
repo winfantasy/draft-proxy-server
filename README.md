@@ -1,6 +1,10 @@
 # Yahoo WebSocket Proxy Server
 ## Service Name: Lateral (lateral.leaguesync.dev)
 
+
+https://github.com/user-attachments/assets/1a004ac9-bc33-4a99-996c-cbeb530e562a
+
+
 A TypeScript Node.js proxy server that enables web applications to connect to Yahoo Fantasy Sports WebSocket servers without Origin header restrictions.
 
 ## Features
