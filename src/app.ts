@@ -54,6 +54,7 @@ class Room {
     public readonly leagueId: string;
     public readonly draftPosition: number; // Primary draft position for Yahoo connection
     public readonly yahooWebSocketUrl: string;
+    public readonly platformUserId: string; // Store platform user ID
     public yahooWs: WebSocket | null = null;
     public clients: Map<WebSocket, { clientId: string; draftPosition: number }> = new Map(); // Map of client to their info
     public isConnectingToYahoo: boolean = false;
@@ -64,11 +65,13 @@ class Room {
     private logger: Logger;
     private connectionTimeout: number;
     private isIntentionalDisconnect: boolean = false; // Track if disconnect is intentional
+    private hasJoined: boolean = false; // Track if we've sent the join message
     
     constructor(
         leagueId: string, 
         draftPosition: number, 
         yahooWebSocketUrl: string, 
+        platformUserId: string,
         logger: Logger,
         maxReconnectAttempts: number = 5,
         connectionTimeout: number = 10000
@@ -77,6 +80,7 @@ class Room {
         this.leagueId = leagueId;
         this.draftPosition = draftPosition;
         this.yahooWebSocketUrl = yahooWebSocketUrl;
+        this.platformUserId = platformUserId;
         this.logger = logger;
         this.maxReconnectAttempts = maxReconnectAttempts;
         this.connectionTimeout = connectionTimeout;
@@ -110,8 +114,9 @@ class Room {
                 this.logger.info(`✅ Connected to Yahoo WebSocket for room ${this.id}`);
                 this.isConnectingToYahoo = false;
                 this.reconnectAttempts = 0;
+                this.hasJoined = false; // Reset join status on new connection
                 
-                // Send join message to Yahoo
+                // Send join message to Yahoo immediately upon connection
                 this.sendJoinMessageToYahoo();
                 this.startHeartbeat();
                 
@@ -174,14 +179,26 @@ class Room {
         }
     }
 
-    private sendJoinMessageToYahoo(): void {
-        if (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN) {
+    public sendJoinMessageToYahoo(): void {
+        if (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN && !this.hasJoined) {
             // Yahoo join message format: 8|{LEAGUE_ID}|{DRAFT_POSITION}|{USER_AGENT}|
-            // Note: We use the first client's draft position for the connection
-            const userAgent = encodeURIComponent('YahooFantasyProxy/1.0');
+            // Build from the room's stored parameters
+            const userAgent = encodeURIComponent(`YahooFantasyProxy/1.0 (${this.platformUserId})`);
             const joinMessage = `8|${this.leagueId}|${this.draftPosition}|${userAgent}|`;
+            
             this.yahooWs.send(joinMessage);
-            this.logger.info(`📤 Sent join message to Yahoo for room ${this.id}: ${joinMessage}`);
+            this.hasJoined = true;
+            
+            this.logger.info(`📤 Sent Yahoo join message for room ${this.id}:`, {
+                leagueId: this.leagueId,
+                draftPosition: this.draftPosition,
+                platformUserId: this.platformUserId,
+                message: joinMessage
+            });
+        } else if (this.hasJoined) {
+            this.logger.debug(`ℹ️ Join message already sent for room ${this.id}`);
+        } else {
+            this.logger.warn(`⚠️ Cannot send join message to Yahoo - not connected in room ${this.id}`);
         }
     }
 
@@ -297,6 +314,7 @@ class Room {
     private disconnectFromYahoo(): void {
         this.logger.info(`🔌 Intentionally disconnecting from Yahoo for room ${this.id}`);
         this.isIntentionalDisconnect = true;
+        this.hasJoined = false; // Reset join status
         
         if (this.yahooWs) {
             this.yahooWs.close(1000, 'No clients remaining in room');
@@ -306,6 +324,7 @@ class Room {
     public cleanup(): void {
         this.logger.info(`🧹 Cleaning up room ${this.id}`);
         this.isIntentionalDisconnect = true;
+        this.hasJoined = false; // Reset join status
         this.stopHeartbeat();
         
         if (this.yahooWs) {
@@ -322,9 +341,11 @@ class Room {
             roomId: this.id,
             leagueId: this.leagueId,
             draftPosition: this.draftPosition, // Primary position used for Yahoo connection
+            platformUserId: this.platformUserId,
             clientsCount: this.clients.size,
             clientDraftPositions: clientPositions, // All client positions in this room
             yahooConnected: this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN,
+            hasJoined: this.hasJoined, // Whether join message was sent
             lastHeartbeat: this.lastHeartbeat,
             reconnectAttempts: this.reconnectAttempts,
             isIntentionalDisconnect: this.isIntentionalDisconnect
@@ -445,7 +466,8 @@ export class YahooWebSocketProxyApp {
                 room = new Room(
                     leagueId, 
                     draftPosition, // Use this client's draft position for Yahoo connection
-                    yahooWebSocketUrl, 
+                    yahooWebSocketUrl,
+                    platformUserId, // Pass platform user ID for join message
                     this.logger,
                     this.config.maxReconnectAttempts || 5,
                     this.config.connectionTimeout || 10000

@@ -1,4 +1,5 @@
-# Yahoo WebSocket Proxy Server: Code Name: TipDrill
+# Yahoo WebSocket Proxy Server
+## Service Name: Lateral (lateral.leaguesync.dev)
 
 A TypeScript Node.js proxy server that enables web applications to connect to Yahoo Fantasy Sports WebSocket servers without Origin header restrictions.
 
@@ -6,6 +7,7 @@ A TypeScript Node.js proxy server that enables web applications to connect to Ya
 
 - **League-based rooms**: Clients are grouped by `leagueId` only - all users in the same league share one Yahoo connection
 - **Multi-user support**: Multiple users with different draft positions can connect to the same league room
+- **Automatic Yahoo join**: Proxy automatically sends Yahoo join message upon connection using provided parameters
 - **No Origin header**: Connects to Yahoo without browser restrictions
 - **Message relay**: Bidirectional message passing between clients and Yahoo
 - **Auto-reconnection**: Handles Yahoo disconnections with exponential backoff
@@ -23,14 +25,21 @@ A TypeScript Node.js proxy server that enables web applications to connect to Ya
 
 ### Example Scenario
 ```
-League 12345:
-├── User A (Draft Position 1) ──┐
-├── User B (Draft Position 3) ──┼── Room "12345" ──── Yahoo WebSocket
-└── User C (Draft Position 7) ──┘
+User A connects to League 12345 with Draft Position 1:
+├── 🏠 Room "12345" created
+├── 🔗 Yahoo WebSocket connection established  
+├── 📤 Auto-send: "8|12345|1|YahooFantasyProxy/1.0 (user-a)|"
+└── 📨 Start receiving Yahoo messages
+
+User B connects to same League 12345 with Draft Position 3:
+├── 🏠 Join existing room "12345"
+├── 🔗 Share same Yahoo connection (no new join message needed)
+└── 📨 Receive all Yahoo messages for League 12345
 
 League 67890:
 ├── User D (Draft Position 2) ──┐
 └── User E (Draft Position 5) ──┼── Room "67890" ──── Yahoo WebSocket
+                                 │   📤 Auto-send: "8|67890|2|YahooFantasyProxy/1.0 (user-d)|"
                                  ┘
 ```
 
@@ -142,13 +151,17 @@ const wsUserB = new WebSocket('ws://localhost:3001/yahoo/websocket/proxy?' + new
 // Both users will:
 // 1. Join the same room ("12345")
 // 2. Share the same Yahoo WebSocket connection
-// 3. Receive all Yahoo messages for League 12345
-// 4. NOT see messages from other leagues
+// 3. Automatically send Yahoo join message (first user only)
+// 4. Receive all Yahoo messages for League 12345
+// 5. NOT see messages from other leagues
 
-// Send message to Yahoo
+// Note: You don't need to manually send the join message!
+// The proxy automatically sends: "8|12345|1|YahooFantasyProxy/1.0 (user-a)|"
+
+// Send other messages to Yahoo
 wsUserA.send(JSON.stringify({
     type: 'yahoo_message',
-    data: '8|12345|1|UserAgent|'  // Yahoo join message
+    data: 'c'  // Heartbeat or other Yahoo protocol messages
 }));
 
 // Receive messages
