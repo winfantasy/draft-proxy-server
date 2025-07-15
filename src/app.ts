@@ -1,200 +1,531 @@
-import { randomUUID } from 'node:crypto';
-import { AsyncLocalStorage } from 'node:async_hooks';
-import { RequestListener } from 'node:http';
-import express, {
-    NextFunction,
-    Request,
-    RequestHandler,
-    Response,
-} from 'express';
-import 'express-async-errors';
-import pino from 'pino';
-import helmet from 'helmet';
-import compression from 'compression';
-import { getClientIp } from 'request-ip';
-import * as ev from 'express-validator';
-import { Config } from './config';
+import express from 'express';
+import WebSocket, { WebSocketServer } from 'ws';
+import cors from 'cors';
+import { v4 as uuidv4 } from 'uuid';
+import { IncomingMessage } from 'http';
+import { Server } from 'http';
 
-export type App = {
-    requestListener: RequestListener;
-    shutdown: () => Promise<void>;
-};
-
-declare global {
-    namespace Express {
-        interface Request {
-            abortSignal: AbortSignal;
-        }
-    }
+// Types
+interface ClientConnection {
+    ws: WebSocket;
+    room: Room;
 }
 
-const LARGE_JSON_PATH = '/large-json-payload';
-const APPLICATION_JSON = 'application/json';
+interface ProxyMessage {
+    type: 'yahoo_message' | 'room_joined' | 'yahoo_connected' | 'yahoo_disconnected' | 'yahoo_error' | 'yahoo_max_reconnect_reached';
+    data?: string;
+    message?: string;
+    error?: string;
+    code?: number;
+    reason?: string;
+    roomId?: string;
+    yahooConnected?: boolean;
+    clientsCount?: number;
+    draftPosition?: number;
+}
 
-export const initApp = async (
-    config: Config,
-    logger: pino.Logger
-): Promise<App> => {
-    const app = express();
-    app.set('trust proxy', true);
-    app.use(
-        express.raw({
-            limit: '1kb',
-            type: (req) => req.headers['content-type'] !== APPLICATION_JSON,
-        })
-    );
-    app.use(
-        express.json({
-            limit: '50kb',
-            type: (req) => {
-                return (
-                    req.headers['content-type'] === APPLICATION_JSON &&
-                    req.url !== LARGE_JSON_PATH
-                );
-            },
-        })
-    );
-    app.use((req, res, next) => {
-        const start = new Date().getTime();
-        const ac = new AbortController();
-        req.abortSignal = ac.signal;
-        res.on('close', ac.abort.bind(ac));
+interface ClientMessage {
+    type: 'yahoo_message';
+    data: string;
+}
 
-        const requestId = req.headers['x-request-id']?.[0] || randomUUID();
+interface Config {
+    port: number;
+    shutdownTimeoutMs: number;
+    env: string;
+    maxReconnectAttempts?: number;
+    heartbeatInterval?: number;
+    connectionTimeout?: number;
+}
 
-        const l = logger.child({ requestId });
+interface Logger {
+    info: (message: any, ...args: any[]) => void;
+    error: (message: any, ...args: any[]) => void;
+    warn: (message: any, ...args: any[]) => void;
+    debug: (message: any, ...args: any[]) => void;
+}
 
-        let bytesRead = 0;
-        req.on('data', (chunk: Buffer) => {
-            bytesRead += chunk.length;
-        });
+// Store active rooms and connections
+const rooms = new Map<string, Room>(); // Map<roomId, Room>
+const clientConnections = new Map<string, ClientConnection>(); // Map<clientId, ClientConnection>
 
-        let bytesWritten = 0;
-        const oldWrite = res.write;
-        const oldEnd = res.end;
-        res.write = function (chunk: Buffer | string, ...rest) {
-            if (chunk) bytesWritten += chunk.length;
+class Room {
+    public readonly id: string;
+    public readonly leagueId: string;
+    public readonly draftPosition: number; // Primary draft position for Yahoo connection
+    public readonly yahooWebSocketUrl: string;
+    public yahooWs: WebSocket | null = null;
+    public clients: Map<WebSocket, { clientId: string; draftPosition: number }> = new Map(); // Map of client to their info
+    public isConnectingToYahoo: boolean = false;
+    public lastHeartbeat: number = Date.now();
+    public reconnectAttempts: number = 0;
+    public readonly maxReconnectAttempts: number;
+    private heartbeatInterval: NodeJS.Timeout | null = null;
+    private logger: Logger;
+    private connectionTimeout: number;
+    private isIntentionalDisconnect: boolean = false; // Track if disconnect is intentional
+    
+    constructor(
+        leagueId: string, 
+        draftPosition: number, 
+        yahooWebSocketUrl: string, 
+        logger: Logger,
+        maxReconnectAttempts: number = 5,
+        connectionTimeout: number = 10000
+    ) {
+        this.id = leagueId; // Room ID is just the league ID
+        this.leagueId = leagueId;
+        this.draftPosition = draftPosition;
+        this.yahooWebSocketUrl = yahooWebSocketUrl;
+        this.logger = logger;
+        this.maxReconnectAttempts = maxReconnectAttempts;
+        this.connectionTimeout = connectionTimeout;
+        
+        this.logger.info(`📝 Created room: ${this.id} for Yahoo URL: ${yahooWebSocketUrl}`);
+    }
 
-            // @ts-ignore
-            return oldWrite.apply(res, [chunk, ...rest]);
-        };
-        // @ts-ignore
-        res.end = function (chunk?: Buffer | string, ...rest) {
-            if (chunk) bytesWritten += chunk.length;
-
-            // @ts-ignore
-            return oldEnd.apply(res, [chunk, ...rest]);
-        };
-
-        res.on('finish', () => {
-            l.info(
-                {
-                    duration: new Date().getTime() - start,
-                    method: req.method,
-                    path: req.path,
-                    status: res.statusCode,
-                    ua: req.headers['user-agent'],
-                    ip: getClientIp(req),
-                    br: bytesRead,
-                    bw: bytesWritten,
-                },
-                'Request handled'
-            );
-        });
-
-        asl.run({ logger: l, requestId }, () => next());
-    });
-    app.use(helmet());
-    app.use(compression());
-
-    app.get(config.healthCheckEndpoint, (req, res) => {
-        res.sendStatus(200);
-    });
-
-    app.get('/hi', (req, res) => {
-        const s = asl.getStore();
-        s?.logger.info('hi');
-        res.send('hi');
-    });
-
-    app.post(
-        '/echo',
-        makeValidationMiddleware([ev.body('name').notEmpty()]),
-        (req, res) => {
-            res.json({ msg: `hi ${req.body.name}` });
-        }
-    );
-
-    app.post(
-        LARGE_JSON_PATH,
-        express.json({ limit: '5mb', type: APPLICATION_JSON }),
-        (req, res) => {
-            // TODO: handle large json payload
-            res.end();
-        }
-    );
-
-    app.get('/abort-signal-propagation', async (req, res) => {
-        for (let i = 0; i < 10; i++) {
-            // simulate some work
-            await new Promise((r) => setTimeout(r, 25));
-
-            if (req.abortSignal.aborted) throw new Error('aborted');
-        }
-
-        const usersRes = await fetch(
-            'https://jsonplaceholder.typicode.com/users',
-            {
-                signal: req.abortSignal,
-            }
-        );
-        if (usersRes.status !== 200) {
-            throw new Error(
-                `unexpected non-200 status code ${usersRes.status}`
-            );
-        }
-        const users = await usersRes.json();
-        res.json(users);
-    });
-
-    app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
-        asl.getStore()?.logger.error(err);
-
-        if (res.headersSent) return;
-
-        res.status(500);
-        res.json({ msg: 'Something went wrong' });
-    });
-
-    return {
-        requestListener: app,
-        shutdown: async () => {
-            // add any cleanup code here including database/redis disconnecting and background job shutdown
-        },
-    };
-};
-
-type Store = {
-    logger: pino.Logger;
-    requestId: string;
-};
-
-const asl = new AsyncLocalStorage<Store>();
-
-export function makeValidationMiddleware(
-    runners: ev.ContextRunner[]
-): RequestHandler {
-    return async function (req: Request, res: Response, next: NextFunction) {
-        await Promise.all(runners.map((runner) => runner.run(req)));
-
-        const errors = ev.validationResult(req);
-        if (!errors.isEmpty()) {
-            res.status(400).json({
-                errors: errors.array(),
-            });
+    async connectToYahoo(): Promise<void> {
+        if (this.isConnectingToYahoo || (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN)) {
             return;
         }
 
-        next();
-    };
+        this.isConnectingToYahoo = true;
+        this.logger.info(`🔗 Connecting to Yahoo WebSocket for room ${this.id}...`);
+
+        try {
+            // Create connection to Yahoo WITHOUT Origin header
+            this.yahooWs = new WebSocket(this.yahooWebSocketUrl, {
+                headers: {
+                    'User-Agent': 'YahooFantasyProxy/1.0',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                    // Explicitly NO Origin header
+                },
+                timeout: this.connectionTimeout
+            });
+
+            this.yahooWs.on('open', () => {
+                this.logger.info(`✅ Connected to Yahoo WebSocket for room ${this.id}`);
+                this.isConnectingToYahoo = false;
+                this.reconnectAttempts = 0;
+                
+                // Send join message to Yahoo
+                this.sendJoinMessageToYahoo();
+                this.startHeartbeat();
+                
+                // Notify all clients that Yahoo connection is established
+                this.broadcastToClients({
+                    type: 'yahoo_connected',
+                    message: 'Connected to Yahoo WebSocket'
+                });
+            });
+
+            this.yahooWs.on('message', (data: WebSocket.RawData) => {
+                const message = data.toString();
+                this.logger.debug(`📨 Yahoo message for room ${this.id}:`, message.substring(0, 100) + '...');
+                
+                // Relay message to all clients in this room
+                this.broadcastToClients({
+                    type: 'yahoo_message',
+                    data: message
+                });
+            });
+
+            this.yahooWs.on('close', (code: number, reason: Buffer) => {
+                this.logger.info(`🔌 Yahoo WebSocket closed for room ${this.id}: ${code} - ${reason.toString()}`);
+                this.isConnectingToYahoo = false;
+                this.stopHeartbeat();
+                
+                // Notify clients
+                this.broadcastToClients({
+                    type: 'yahoo_disconnected',
+                    code: code,
+                    reason: reason.toString()
+                });
+
+                // Only attempt to reconnect if:
+                // 1. Not an intentional disconnect (room cleanup)
+                // 2. Not a normal closure (code 1000)
+                // 3. There are still clients in the room
+                if (!this.isIntentionalDisconnect && code !== 1000 && this.clients.size > 0) {
+                    this.logger.info(`🔄 Yahoo disconnected unexpectedly, attempting reconnect for room ${this.id}`);
+                    this.handleYahooReconnect();
+                } else {
+                    this.logger.info(`🛑 Yahoo disconnected - not reconnecting (intentional: ${this.isIntentionalDisconnect}, clients: ${this.clients.size}, code: ${code})`);
+                }
+            });
+
+            this.yahooWs.on('error', (error: Error) => {
+                this.logger.error(`❌ Yahoo WebSocket error for room ${this.id}:`, error);
+                this.isConnectingToYahoo = false;
+                
+                this.broadcastToClients({
+                    type: 'yahoo_error',
+                    error: error.message
+                });
+            });
+
+        } catch (error) {
+            this.logger.error(`❌ Failed to connect to Yahoo for room ${this.id}:`, error);
+            this.isConnectingToYahoo = false;
+            throw error;
+        }
+    }
+
+    private sendJoinMessageToYahoo(): void {
+        if (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN) {
+            // Yahoo join message format: 8|{LEAGUE_ID}|{DRAFT_POSITION}|{USER_AGENT}|
+            // Note: We use the first client's draft position for the connection
+            const userAgent = encodeURIComponent('YahooFantasyProxy/1.0');
+            const joinMessage = `8|${this.leagueId}|${this.draftPosition}|${userAgent}|`;
+            this.yahooWs.send(joinMessage);
+            this.logger.info(`📤 Sent join message to Yahoo for room ${this.id}: ${joinMessage}`);
+        }
+    }
+
+    private startHeartbeat(): void {
+        this.heartbeatInterval = setInterval(() => {
+            if (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN) {
+                this.yahooWs.send('c'); // Yahoo heartbeat
+                this.lastHeartbeat = Date.now();
+            }
+        }, 30000); // Every 30 seconds
+    }
+
+    private stopHeartbeat(): void {
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+            this.heartbeatInterval = null;
+        }
+    }
+
+    private handleYahooReconnect(): void {
+        // Double-check that we still have clients before attempting reconnect
+        if (this.clients.size === 0) {
+            this.logger.info(`🛑 No clients in room ${this.id}, canceling reconnect attempt`);
+            return;
+        }
+
+        if (this.isIntentionalDisconnect) {
+            this.logger.info(`🛑 Intentional disconnect for room ${this.id}, not reconnecting`);
+            return;
+        }
+
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            this.reconnectAttempts++;
+            const delay = 1000 * Math.pow(2, this.reconnectAttempts - 1); // Exponential backoff
+            
+            this.logger.info(`⏳ Reconnecting to Yahoo in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}) for room ${this.id}`);
+            
+            setTimeout(() => {
+                // Check again before actually reconnecting
+                if (this.clients.size > 0 && !this.isIntentionalDisconnect) {
+                    this.connectToYahoo();
+                } else {
+                    this.logger.info(`🛑 Room ${this.id} conditions changed, canceling delayed reconnect`);
+                }
+            }, delay);
+        } else {
+            this.logger.error(`❌ Max reconnection attempts reached for Yahoo connection in room ${this.id}`);
+            this.broadcastToClients({
+                type: 'yahoo_max_reconnect_reached',
+                message: 'Failed to reconnect to Yahoo after maximum attempts'
+            });
+        }
+    }
+
+    public addClient(clientWs: WebSocket, clientId: string, clientDraftPosition: number): void {
+        this.clients.set(clientWs, { clientId, draftPosition: clientDraftPosition });
+        (clientWs as any).roomId = this.id;
+        (clientWs as any).clientId = clientId;
+        (clientWs as any).draftPosition = clientDraftPosition;
+        
+        this.logger.info(`👤 Client ${clientId} (draft position ${clientDraftPosition}) joined room ${this.id}. Total clients: ${this.clients.size}`);
+        
+        // If this is the first client and we're not connected to Yahoo, connect now
+        if (this.clients.size === 1 && (!this.yahooWs || this.yahooWs.readyState !== WebSocket.OPEN)) {
+            this.connectToYahoo();
+        }
+        
+        // Send current status to the new client
+        clientWs.send(JSON.stringify({
+            type: 'room_joined',
+            roomId: this.id,
+            yahooConnected: this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN,
+            clientsCount: this.clients.size,
+            draftPosition: clientDraftPosition
+        } as ProxyMessage));
+    }
+
+    public removeClient(clientWs: WebSocket): void {
+        const clientInfo = this.clients.get(clientWs);
+        this.clients.delete(clientWs);
+        
+        if (clientInfo) {
+            this.logger.info(`👤 Client ${clientInfo.clientId} (draft position ${clientInfo.draftPosition}) left room ${this.id}. Remaining clients: ${this.clients.size}`);
+        }
+        
+        // If no clients remain, disconnect from Yahoo and clean up
+        if (this.clients.size === 0) {
+            this.logger.info(`🧹 Room ${this.id} is empty, disconnecting from Yahoo and cleaning up`);
+            this.disconnectFromYahoo();
+            this.cleanup();
+            rooms.delete(this.id);
+        }
+    }
+
+    private broadcastToClients(message: ProxyMessage): void {
+        const messageStr = JSON.stringify(message);
+        this.clients.forEach((clientInfo, clientWs) => {
+            if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(messageStr);
+            }
+        });
+    }
+
+    public sendToYahoo(message: string): void {
+        if (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN) {
+            this.logger.debug(`📤 Sending to Yahoo from room ${this.id}:`, message);
+            this.yahooWs.send(message);
+        } else {
+            this.logger.warn(`⚠️ Cannot send to Yahoo - not connected in room ${this.id}`);
+        }
+    }
+
+    private disconnectFromYahoo(): void {
+        this.logger.info(`🔌 Intentionally disconnecting from Yahoo for room ${this.id}`);
+        this.isIntentionalDisconnect = true;
+        
+        if (this.yahooWs) {
+            this.yahooWs.close(1000, 'No clients remaining in room');
+        }
+    }
+
+    public cleanup(): void {
+        this.logger.info(`🧹 Cleaning up room ${this.id}`);
+        this.isIntentionalDisconnect = true;
+        this.stopHeartbeat();
+        
+        if (this.yahooWs) {
+            this.yahooWs.close(1000, 'Room cleanup');
+            this.yahooWs = null;
+        }
+        
+        this.clients.clear();
+    }
+
+    public getStatus() {
+        const clientPositions = Array.from(this.clients.values()).map(client => client.draftPosition);
+        return {
+            roomId: this.id,
+            leagueId: this.leagueId,
+            draftPosition: this.draftPosition, // Primary position used for Yahoo connection
+            clientsCount: this.clients.size,
+            clientDraftPositions: clientPositions, // All client positions in this room
+            yahooConnected: this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN,
+            lastHeartbeat: this.lastHeartbeat,
+            reconnectAttempts: this.reconnectAttempts,
+            isIntentionalDisconnect: this.isIntentionalDisconnect
+        };
+    }
+}
+
+export class YahooWebSocketProxyApp {
+    private app: express.Application;
+    private wss: WebSocketServer | null = null;
+    private config: Config;
+    private logger: Logger;
+
+    constructor(config: Config, logger: Logger) {
+        this.config = config;
+        this.logger = logger;
+        this.app = express();
+        this.setupMiddleware();
+        this.setupRoutes();
+    }
+
+    private setupMiddleware(): void {
+        // Enable CORS for all routes
+        this.app.use(cors({
+            origin: true,
+            credentials: true
+        }));
+
+        this.app.use(express.json());
+    }
+
+    private setupRoutes(): void {
+        // Health check endpoint
+        this.app.get('/health', (req, res) => {
+            res.json({
+                status: 'healthy',
+                activeRooms: rooms.size,
+                totalClients: clientConnections.size,
+                rooms: Array.from(rooms.keys())
+            });
+        });
+
+        // Get room status
+        this.app.get('/rooms/:roomId/status', (req, res) => {
+            const room = rooms.get(req.params.roomId);
+            if (!room) {
+                return res.status(404).json({ error: 'Room not found' });
+            }
+            
+            res.json(room.getStatus());
+        });
+
+        // Get all rooms status
+        this.app.get('/rooms', (req, res) => {
+            const roomsStatus = Array.from(rooms.values()).map(room => room.getStatus());
+            res.json({
+                totalRooms: rooms.size,
+                rooms: roomsStatus
+            });
+        });
+
+        // Force cleanup a room (admin endpoint)
+        this.app.delete('/rooms/:roomId', (req, res) => {
+            const room = rooms.get(req.params.roomId);
+            if (!room) {
+                return res.status(404).json({ error: 'Room not found' });
+            }
+            
+            this.logger.info(`🗑️ Force cleanup requested for room ${req.params.roomId}`);
+            
+            // Close all client connections in this room
+            room.clients.forEach((clientInfo, clientWs) => {
+                if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.close(1001, 'Room force cleanup');
+                }
+            });
+            
+            // Cleanup the room
+            room.cleanup();
+            rooms.delete(req.params.roomId);
+            
+            res.json({ 
+                message: `Room ${req.params.roomId} has been cleaned up`,
+                roomId: req.params.roomId
+            });
+        });
+    }
+
+    public setupWebSocketServer(server: Server): void {
+        // WebSocket server for client connections
+        this.wss = new WebSocketServer({ 
+            server,
+            path: '/yahoo/websocket/proxy'
+        });
+
+        this.wss.on('connection', (ws: WebSocket, request: IncomingMessage) => {
+            const url = new URL(request.url!, `http://${request.headers.host}`);
+            const params = url.searchParams;
+            
+            const leagueId = params.get('leagueId');
+            const draftPosition = parseInt(params.get('draftPosition') || '0');
+            const yahooWebSocketUrl = params.get('websocketUrl');
+            const platformUserId = params.get('platformUserId') || 'unknown';
+            
+            if (!leagueId || !draftPosition || !yahooWebSocketUrl) {
+                ws.close(1008, 'Missing required parameters: leagueId, draftPosition, websocketUrl');
+                return;
+            }
+
+            const clientId = uuidv4();
+            const roomId = leagueId; // Room ID is just the league ID
+            
+            this.logger.info(`🔗 New client connection for room ${roomId}, client: ${clientId}, draft position: ${draftPosition}`);
+            
+            // Get or create room
+            let room = rooms.get(roomId);
+            if (!room) {
+                room = new Room(
+                    leagueId, 
+                    draftPosition, // Use this client's draft position for Yahoo connection
+                    yahooWebSocketUrl, 
+                    this.logger,
+                    this.config.maxReconnectAttempts || 5,
+                    this.config.connectionTimeout || 10000
+                );
+                rooms.set(roomId, room);
+            }
+            
+            // Add client to room with their specific draft position
+            room.addClient(ws, clientId, draftPosition);
+            clientConnections.set(clientId, { ws, room });
+
+            // Handle messages from client
+            ws.on('message', (data: WebSocket.RawData) => {
+                try {
+                    const message = data.toString();
+                    this.logger.debug(`📨 Client message from ${clientId}:`, message);
+                    
+                    // Check if it's a JSON control message or raw Yahoo message
+                    try {
+                        const jsonMessage: ClientMessage = JSON.parse(message);
+                        if (jsonMessage.type === 'yahoo_message') {
+                            // Client wants to send a message to Yahoo
+                            room!.sendToYahoo(jsonMessage.data);
+                        } else {
+                            this.logger.debug(`🎛️ Control message from client ${clientId}:`, jsonMessage);
+                        }
+                    } catch {
+                        // Not JSON, treat as raw Yahoo message
+                        room!.sendToYahoo(message);
+                    }
+                } catch (error) {
+                    this.logger.error(`❌ Error handling client message from ${clientId}:`, error);
+                }
+            });
+
+            ws.on('close', (code: number, reason: Buffer) => {
+                this.logger.info(`🔌 Client ${clientId} disconnected: ${code} - ${reason.toString()}`);
+                room!.removeClient(ws);
+                clientConnections.delete(clientId);
+            });
+
+            ws.on('error', (error: Error) => {
+                this.logger.error(`❌ Client WebSocket error for ${clientId}:`, error);
+            });
+        });
+
+        this.logger.info(`📡 WebSocket server setup on path: /yahoo/websocket/proxy`);
+    }
+
+    public get requestListener() {
+        return this.app;
+    }
+
+    public async shutdown(): Promise<void> {
+        this.logger.info('🛑 Shutting down Yahoo WebSocket Proxy...');
+        
+        // Close all WebSocket connections
+        if (this.wss) {
+            this.wss.clients.forEach((ws) => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.close(1001, 'Server shutdown');
+                }
+            });
+            this.wss.close();
+        }
+
+        // Cleanup all rooms
+        rooms.forEach(room => room.cleanup());
+        rooms.clear();
+        clientConnections.clear();
+
+        this.logger.info('✅ Yahoo WebSocket Proxy shutdown complete');
+    }
+}
+
+export async function initApp(config: Config, logger: Logger): Promise<YahooWebSocketProxyApp> {
+    logger.info('🚀 Initializing Yahoo WebSocket Proxy App...');
+    
+    const app = new YahooWebSocketProxyApp(config, logger);
+    
+    logger.info('✅ Yahoo WebSocket Proxy App initialized');
+    return app;
 }

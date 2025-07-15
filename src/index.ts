@@ -9,8 +9,19 @@ const main = async () => {
     const config = await initConfig();
     const logger = await initLogging(config);
     const app = await initApp(config, logger);
-    const server = createServer(app.requestListener)
-        .listen(config.port, () => logger.info(`HTTP server listening on port ${config.port}`));
+    
+    // Create HTTP server
+    const server = createServer(app.requestListener);
+    
+    // Setup WebSocket server after HTTP server is created
+    app.setupWebSocketServer(server);
+    
+    // Start listening
+    server.listen(config.port, () => {
+        logger.info(`🚀 Yahoo WebSocket Proxy Server listening on port ${config.port}`);
+        logger.info(`📡 WebSocket endpoint: ws://localhost:${config.port}/yahoo/websocket/proxy`);
+        logger.info(`🩺 Health check: http://localhost:${config.port}/health`);
+    });
 
     gracefulShutdown(server, {
         timeout: config.shutdownTimeoutMs,
@@ -28,4 +39,7 @@ const main = async () => {
     });
 }
 
-main();
+main().catch((error) => {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+});
