@@ -2,10 +2,10 @@
   "name": "yahoo-websocket-proxy",
   "version": "1.0.0",
   "description": "WebSocket proxy server for Yahoo Fantasy Sports connections without Origin header",
-  "main": "dist/index.js",
+  "main": "src/index.ts",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "ts-node-dev src/index.ts",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "dev:watch": "nodemon --exec ts-node src/index.ts",
     "clean": "rimraf dist",
