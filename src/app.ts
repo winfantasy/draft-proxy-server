@@ -25,8 +25,13 @@ interface ProxyMessage {
 }
 
 interface ClientMessage {
-    type: 'yahoo_message';
-    data: string;
+    type: 'yahoo_message' | 'yahoo_reconnect';
+    data: string | ReconnectData;
+}
+
+interface ReconnectData {
+    leagueId: string;
+    draftPosition: number;
 }
 
 interface Config {
@@ -150,16 +155,8 @@ class Room {
                     reason: reason.toString()
                 });
 
-                // Only attempt to reconnect if:
-                // 1. Not an intentional disconnect (room cleanup)
-                // 2. Not a normal closure (code 1000)
-                // 3. There are still clients in the room
-                if (!this.isIntentionalDisconnect && code !== 1000 && this.clients.size > 0) {
-                    this.logger.info(`🔄 Yahoo disconnected unexpectedly, attempting reconnect for room ${this.id}`);
-                    this.handleYahooReconnect();
-                } else {
-                    this.logger.info(`🛑 Yahoo disconnected - not reconnecting (intentional: ${this.isIntentionalDisconnect}, clients: ${this.clients.size}, code: ${code})`);
-                }
+                // Do NOT automatically reconnect - wait for client to initiate reconnection
+                this.logger.info(`⏳ Yahoo disconnected for room ${this.id} - waiting for client to initiate reconnection`);
             });
 
             this.yahooWs.on('error', (error: Error) => {
@@ -202,6 +199,43 @@ class Room {
         }
     }
 
+    // New method to handle client-initiated reconnection
+    public async handleClientReconnectRequest(reconnectData: ReconnectData): Promise<void> {
+        this.logger.info(`🔄 Client-initiated reconnection request for room ${this.id}:`, reconnectData);
+        
+        // Validate the reconnection data
+        if (reconnectData.leagueId !== this.leagueId) {
+            this.logger.warn(`⚠️ League ID mismatch in reconnect request: expected ${this.leagueId}, got ${reconnectData.leagueId}`);
+            throw new Error(`League ID mismatch: expected ${this.leagueId}, got ${reconnectData.leagueId}`);
+        }
+        
+        // Update draft position if it has changed
+        if (reconnectData.draftPosition !== this.draftPosition) {
+            this.logger.info(`📝 Updating draft position for room ${this.id}: ${this.draftPosition} -> ${reconnectData.draftPosition}`);
+            (this as any).draftPosition = reconnectData.draftPosition; // Cast to bypass readonly
+        }
+        
+        // Close existing connection if any
+        if (this.yahooWs) {
+            this.isIntentionalDisconnect = true;
+            this.yahooWs.close(1000, 'Client-initiated reconnection');
+            this.yahooWs = null;
+        }
+        
+        // Reset connection state
+        this.isIntentionalDisconnect = false;
+        this.hasJoined = false;
+        
+        try {
+            // Attempt to reconnect using stored room data
+            await this.connectToYahoo();
+            this.logger.info(`✅ Client-initiated reconnection successful for room ${this.id}`);
+        } catch (error) {
+            this.logger.error(`❌ Client-initiated reconnection failed for room ${this.id}:`, error);
+            throw error;
+        }
+    }
+
     private startHeartbeat(): void {
         this.heartbeatInterval = setInterval(() => {
             if (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN) {
@@ -215,41 +249,6 @@ class Room {
         if (this.heartbeatInterval) {
             clearInterval(this.heartbeatInterval);
             this.heartbeatInterval = null;
-        }
-    }
-
-    private handleYahooReconnect(): void {
-        // Double-check that we still have clients before attempting reconnect
-        if (this.clients.size === 0) {
-            this.logger.info(`🛑 No clients in room ${this.id}, canceling reconnect attempt`);
-            return;
-        }
-
-        if (this.isIntentionalDisconnect) {
-            this.logger.info(`🛑 Intentional disconnect for room ${this.id}, not reconnecting`);
-            return;
-        }
-
-        if (this.reconnectAttempts < this.maxReconnectAttempts) {
-            this.reconnectAttempts++;
-            const delay = 1000 * Math.pow(2, this.reconnectAttempts - 1); // Exponential backoff
-            
-            this.logger.info(`⏳ Reconnecting to Yahoo in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}) for room ${this.id}`);
-            
-            setTimeout(() => {
-                // Check again before actually reconnecting
-                if (this.clients.size > 0 && !this.isIntentionalDisconnect) {
-                    this.connectToYahoo();
-                } else {
-                    this.logger.info(`🛑 Room ${this.id} conditions changed, canceling delayed reconnect`);
-                }
-            }, delay);
-        } else {
-            this.logger.error(`❌ Max reconnection attempts reached for Yahoo connection in room ${this.id}`);
-            this.broadcastToClients({
-                type: 'yahoo_max_reconnect_reached',
-                message: 'Failed to reconnect to Yahoo after maximum attempts'
-            });
         }
     }
 
@@ -438,7 +437,7 @@ export class YahooWebSocketProxyApp {
         // WebSocket server for client connections
         this.wss = new WebSocketServer({ 
             server,
-            path: '/yahoo/websocket/proxy'
+            path: '/yahoo/websocket/connection'
         });
 
         this.wss.on('connection', (ws: WebSocket, request: IncomingMessage) => {
@@ -490,7 +489,19 @@ export class YahooWebSocketProxyApp {
                         const jsonMessage: ClientMessage = JSON.parse(message);
                         if (jsonMessage.type === 'yahoo_message') {
                             // Client wants to send a message to Yahoo
-                            room!.sendToYahoo(jsonMessage.data);
+                            room!.sendToYahoo(jsonMessage.data as string);
+                        } else if (jsonMessage.type === 'yahoo_reconnect') {
+                            // Client wants to reconnect to Yahoo
+                            const reconnectData = jsonMessage.data as ReconnectData;
+                            this.logger.info(`🔄 Client ${clientId} requested Yahoo reconnection:`, reconnectData);
+                            
+                            room!.handleClientReconnectRequest(reconnectData).catch(error => {
+                                this.logger.error(`❌ Failed to handle client reconnection for ${clientId}:`, error);
+                                ws.send(JSON.stringify({
+                                    type: 'yahoo_error',
+                                    error: 'Failed to reconnect to Yahoo'
+                                }));
+                            });
                         } else {
                             this.logger.debug(`🎛️ Control message from client ${clientId}:`, jsonMessage);
                         }
@@ -514,7 +525,7 @@ export class YahooWebSocketProxyApp {
             });
         });
 
-        this.logger.info(`📡 WebSocket server setup on path: /yahoo/websocket/proxy`);
+        this.logger.info(`📡 WebSocket server setup on path: /yahoo/websocket/connection`);
     }
 
     public get requestListener() {
