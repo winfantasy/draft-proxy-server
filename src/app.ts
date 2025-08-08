@@ -72,6 +72,7 @@ class Room {
     private isIntentionalDisconnect: boolean = false; // Track if disconnect is intentional
     private hasJoined: boolean = false; // Track if we've sent the join message
     private cleanupTimeout: NodeJS.Timeout | null = null; // Delay room cleanup for rapid reconnections
+    private isReconnectingForNewClient: boolean = false; // Track if reconnecting due to new client
     
     constructor(
         leagueId: string, 
@@ -126,11 +127,16 @@ class Room {
                 this.sendJoinMessageToYahoo();
                 this.startHeartbeat();
                 
-                // Notify all clients that Yahoo connection is established
-                this.broadcastToClients({
-                    type: 'yahoo_connected',
-                    message: 'Connected to Yahoo WebSocket'
-                });
+                // Only notify clients if this is NOT a reconnection due to new client joining
+                if (!this.isReconnectingForNewClient) {
+                    this.broadcastToClients({
+                        type: 'yahoo_connected',
+                        message: 'Connected to Yahoo WebSocket'
+                    });
+                }
+                
+                // Reset the flag after connection
+                this.isReconnectingForNewClient = false;
             });
 
             this.yahooWs.on('message', (data: WebSocket.RawData) => {
@@ -149,12 +155,14 @@ class Room {
                 this.isConnectingToYahoo = false;
                 this.stopHeartbeat();
                 
-                // Notify clients
-                this.broadcastToClients({
-                    type: 'yahoo_disconnected',
-                    code: code,
-                    reason: reason.toString()
-                });
+                // Only notify clients if this is NOT a reconnection due to new client joining
+                if (!this.isReconnectingForNewClient) {
+                    this.broadcastToClients({
+                        type: 'yahoo_disconnected',
+                        code: code,
+                        reason: reason.toString()
+                    });
+                }
 
                 // Do NOT automatically reconnect - wait for client to initiate reconnection
                 this.logger.info(`⏳ Yahoo disconnected for room ${this.id} - waiting for client to initiate reconnection`);
@@ -265,6 +273,9 @@ class Room {
         // This ensures we get a fresh initialization message from the server
         if (this.clients.size > 0 || (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN)) {
             this.logger.info(`🔄 New client joining room ${this.id} - forcing Yahoo reconnection for fresh initialization`);
+            
+            // Set flag to suppress disconnect/reconnect broadcasts
+            this.isReconnectingForNewClient = true;
             
             // Close existing Yahoo connection
             if (this.yahooWs) {
