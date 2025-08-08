@@ -71,6 +71,7 @@ class Room {
     private connectionTimeout: number;
     private isIntentionalDisconnect: boolean = false; // Track if disconnect is intentional
     private hasJoined: boolean = false; // Track if we've sent the join message
+    private cleanupTimeout: NodeJS.Timeout | null = null; // Delay room cleanup for rapid reconnections
     
     constructor(
         leagueId: string, 
@@ -253,6 +254,30 @@ class Room {
     }
 
     public addClient(clientWs: WebSocket, clientId: string, clientDraftPosition: number): void {
+        // Cancel any pending cleanup if a new client is joining
+        if (this.cleanupTimeout) {
+            clearTimeout(this.cleanupTimeout);
+            this.cleanupTimeout = null;
+            this.logger.info(`⏸️ Cancelled pending room cleanup for room ${this.id} - new client joining`);
+        }
+        
+        // If there are existing clients, force disconnect and reconnect to Yahoo
+        // This ensures we get a fresh initialization message from the server
+        if (this.clients.size > 0 || (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN)) {
+            this.logger.info(`🔄 New client joining room ${this.id} - forcing Yahoo reconnection for fresh initialization`);
+            
+            // Close existing Yahoo connection
+            if (this.yahooWs) {
+                this.isIntentionalDisconnect = true;
+                this.yahooWs.close(1000, 'New client joined - forcing reconnection');
+                this.yahooWs = null;
+            }
+            
+            // Reset connection state
+            this.isIntentionalDisconnect = false;
+            this.hasJoined = false;
+        }
+        
         this.clients.set(clientWs, { clientId, draftPosition: clientDraftPosition });
         (clientWs as any).roomId = this.id;
         (clientWs as any).clientId = clientId;
@@ -260,16 +285,14 @@ class Room {
         
         this.logger.info(`👤 Client ${clientId} (draft position ${clientDraftPosition}) joined room ${this.id}. Total clients: ${this.clients.size}`);
         
-        // If this is the first client and we're not connected to Yahoo, connect now
-        if (this.clients.size === 1 && (!this.yahooWs || this.yahooWs.readyState !== WebSocket.OPEN)) {
-            this.connectToYahoo();
-        }
+        // Always connect/reconnect to Yahoo when a new client joins
+        this.connectToYahoo();
         
         // Send current status to the new client
         clientWs.send(JSON.stringify({
             type: 'room_joined',
             roomId: this.id,
-            yahooConnected: this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN,
+            yahooConnected: false, // Will be false since we're reconnecting
             clientsCount: this.clients.size,
             draftPosition: clientDraftPosition
         } as ProxyMessage));
@@ -283,12 +306,22 @@ class Room {
             this.logger.info(`👤 Client ${clientInfo.clientId} (draft position ${clientInfo.draftPosition}) left room ${this.id}. Remaining clients: ${this.clients.size}`);
         }
         
-        // If no clients remain, disconnect from Yahoo and clean up
+        // If no clients remain, schedule cleanup with a delay to handle rapid reconnections
         if (this.clients.size === 0) {
-            this.logger.info(`🧹 Room ${this.id} is empty, disconnecting from Yahoo and cleaning up`);
-            this.disconnectFromYahoo();
-            this.cleanup();
-            rooms.delete(this.id);
+            this.logger.info(`⏱️ Room ${this.id} is empty, scheduling cleanup in 2 seconds...`);
+            
+            // Cancel any existing cleanup timeout
+            if (this.cleanupTimeout) {
+                clearTimeout(this.cleanupTimeout);
+            }
+            
+            // Schedule cleanup after a delay to handle browser refreshes
+            this.cleanupTimeout = setTimeout(() => {
+                this.logger.info(`🧹 Cleaning up empty room ${this.id}`);
+                this.disconnectFromYahoo();
+                this.cleanup();
+                rooms.delete(this.id);
+            }, 2000); // 2 second delay
         }
     }
 
@@ -325,6 +358,12 @@ class Room {
         this.isIntentionalDisconnect = true;
         this.hasJoined = false; // Reset join status
         this.stopHeartbeat();
+        
+        // Clear any pending cleanup timeout
+        if (this.cleanupTimeout) {
+            clearTimeout(this.cleanupTimeout);
+            this.cleanupTimeout = null;
+        }
         
         if (this.yahooWs) {
             this.yahooWs.close(1000, 'Room cleanup');
@@ -472,6 +511,23 @@ export class YahooWebSocketProxyApp {
                     this.config.connectionTimeout || 10000
                 );
                 rooms.set(roomId, room);
+            } else {
+                // If room exists but has a different websocket URL, we should recreate it
+                // This handles cases where the Yahoo websocket URL might have changed
+                if (room.yahooWebSocketUrl !== yahooWebSocketUrl) {
+                    this.logger.info(`🔄 Room ${roomId} exists but with different Yahoo URL, recreating room`);
+                    room.cleanup();
+                    room = new Room(
+                        leagueId, 
+                        draftPosition,
+                        yahooWebSocketUrl,
+                        platformUserId,
+                        this.logger,
+                        this.config.maxReconnectAttempts || 5,
+                        this.config.connectionTimeout || 10000
+                    );
+                    rooms.set(roomId, room);
+                }
             }
             
             // Add client to room with their specific draft position
