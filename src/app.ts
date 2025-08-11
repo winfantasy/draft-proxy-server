@@ -60,6 +60,7 @@ class Room {
     public readonly draftPosition: number; // Primary draft position for Yahoo connection
     public readonly yahooWebSocketUrl: string;
     public readonly platformUserId: string; // Store platform user ID
+    public readonly auth?: string; // Optional auth field for join message
     public yahooWs: WebSocket | null = null;
     public clients: Map<WebSocket, { clientId: string; draftPosition: number }> = new Map(); // Map of client to their info
     public isConnectingToYahoo: boolean = false;
@@ -81,13 +82,15 @@ class Room {
         platformUserId: string,
         logger: Logger,
         maxReconnectAttempts: number = 5,
-        connectionTimeout: number = 10000
+        connectionTimeout: number = 10000,
+        auth?: string
     ) {
         this.id = leagueId; // Room ID is just the league ID
         this.leagueId = leagueId;
         this.draftPosition = draftPosition;
         this.yahooWebSocketUrl = yahooWebSocketUrl;
         this.platformUserId = platformUserId;
+        this.auth = auth;
         this.logger = logger;
         this.maxReconnectAttempts = maxReconnectAttempts;
         this.connectionTimeout = connectionTimeout;
@@ -187,10 +190,15 @@ class Room {
 
     public sendJoinMessageToYahoo(): void {
         if (this.yahooWs && this.yahooWs.readyState === WebSocket.OPEN && !this.hasJoined) {
-            // Yahoo join message format: 8|{LEAGUE_ID}|{DRAFT_POSITION}|{USER_AGENT}|
+            // Yahoo join message format: 8|{LEAGUE_ID}|{DRAFT_POSITION}|{USER_AGENT}|{AUTH}
             // Build from the room's stored parameters
             const userAgent = encodeURIComponent(`YahooFantasyProxy/1.0 (${this.platformUserId})`);
-            const joinMessage = `8|${this.leagueId}|${this.draftPosition}|${userAgent}|`;
+            let joinMessage = `8|${this.leagueId}|${this.draftPosition}|${userAgent}|`;
+            
+            // Add auth field if present
+            if (this.auth) {
+                joinMessage += this.auth;
+            }
             
             this.yahooWs.send(joinMessage);
             this.hasJoined = true;
@@ -199,6 +207,7 @@ class Room {
                 leagueId: this.leagueId,
                 draftPosition: this.draftPosition,
                 platformUserId: this.platformUserId,
+                auth: this.auth || 'none',
                 message: joinMessage
             });
         } else if (this.hasJoined) {
@@ -498,6 +507,7 @@ export class YahooWebSocketProxyApp {
             const draftPosition = parseInt(params.get('draftPosition') || '0');
             const yahooWebSocketUrl = params.get('websocketUrl');
             const platformUserId = params.get('platformUserId') || 'unknown';
+            const auth = params.get('auth') || undefined;
             
             if (!leagueId || !draftPosition || !yahooWebSocketUrl) {
                 ws.close(1008, 'Missing required parameters: leagueId, draftPosition, websocketUrl');
@@ -519,7 +529,8 @@ export class YahooWebSocketProxyApp {
                     platformUserId, // Pass platform user ID for join message
                     this.logger,
                     this.config.maxReconnectAttempts || 5,
-                    this.config.connectionTimeout || 10000
+                    this.config.connectionTimeout || 10000,
+                    auth
                 );
                 rooms.set(roomId, room);
             } else {
@@ -535,7 +546,8 @@ export class YahooWebSocketProxyApp {
                         platformUserId,
                         this.logger,
                         this.config.maxReconnectAttempts || 5,
-                        this.config.connectionTimeout || 10000
+                        this.config.connectionTimeout || 10000,
+                        auth
                     );
                     rooms.set(roomId, room);
                 }
